@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require("uuid")
 
 module.exports = {
 	imapFactory: (config, sinceDate, beforeDate) => {
+		// Create one IMAP client instance per factory call.
 		const client = new ImapFlow({
 			host: config.credentials.host,
 			port: config.credentials.port,
@@ -25,6 +26,8 @@ module.exports = {
 			},
 
 			async getSeqNos() {
+				// Search returns sequence numbers from the currently opened mailbox.
+				// Note: IMAP "seen: true" means already-read messages.
 				let seqNos = await client.search({
 					seen: config.onlyFetchUnreadEmails,
 					since: sinceDate,
@@ -34,6 +37,7 @@ module.exports = {
 			},
 
 			async getAttachmentData(uid, part) {
+				// Download returns a readable stream as "content".
 				let { content } = await client.download(uid, part, { uid: true });
 				return content;
 			},
@@ -45,6 +49,7 @@ module.exports = {
 					// Move messages to another mailbox
 					await client.messageMove(seqNos, destMailBox);
 				} finally {
+					// Always release lock if it was acquired.
 					lock.release();
 				}
 			},
@@ -54,6 +59,7 @@ module.exports = {
 					return [];
 				}
 
+				// Worker-pool concurrency: fetch/process up to N messages in parallel.
 				const concurrency = Math.max(1, Number(messageConcurrency) || 1);
 				const workerCount = Math.min(concurrency, seqNos.length);
 				const results = new Array(seqNos.length);
@@ -61,31 +67,39 @@ module.exports = {
 
 				const worker = async () => {
 					while (true) {
+						// Each worker claims the next sequence number index.
 						const currentIndex = nextIndex++;
 						if (currentIndex >= seqNos.length) {
 							return;
 						}
 
 						const seqNo = seqNos[currentIndex];
+						// Fetch only fields required by processor and attachment parsing.
 						const message = await client.fetchOne(seqNo, {
 							envelope: true,
 							bodyStructure: true,
 						});
 
 						if (!message) {
+							// Keep array alignment; removed before return.
+							// fetchOne can return false for missing/expunged sequence numbers.
 							results[currentIndex] = null;
 							continue;
 						}
 
+						// Parse MIME body structure to collect attachment parts.
 						const attachments = message.bodyStructure
 							? findAttachments(message.bodyStructure)
 							: [];
 
+						// Caller-provided processor may do I/O (download, save, DB write, etc.).
 						results[currentIndex] = await processorFunc(message, attachments, seqNo);
 					}
 				};
 
 				await Promise.all(Array.from({ length: workerCount }, () => worker()));
+				// Return only successfully fetched messages.
+				// If any worker throws, Promise.all rejects and caller handles the error.
 				return results.filter((x) => x !== null);
 			},
 		};
@@ -93,6 +107,7 @@ module.exports = {
 };
 
 function extensionRegex(str) {
+	// Keep only alpha chars in file extension for safer generated names.
 	let ext = /(?:\.([^.]+))?$/.exec(str)[1] || '';
 	return ext.replace(/[^A-Za-z]+/, '');
 }
@@ -100,6 +115,7 @@ function extensionRegex(str) {
 function findAttachments(node, path = []) {
 	let attachments = [];
 
+	// Treat parts with attachment-like disposition or filename metadata as files.
 	if (
 		((node.disposition === 'attachment' ||
 			(node.dispositionParameters && node.dispositionParameters.filename)) &&
@@ -117,6 +133,7 @@ function findAttachments(node, path = []) {
 		}
 
 		let uid = uuidv4();
+		// Use UUID filenames to avoid collisions when source filenames repeat.
 		let filename = uid;
 		let extension = extensionRegex(
 			attachmentFilename
@@ -124,6 +141,7 @@ function findAttachments(node, path = []) {
 		if (extension != '') filename += '.' + extension;
 
 		attachments.push({
+			// MIME part numbering (e.g. 2, 1.2, 3.1.1).
 			part: path.length ? path.join('.') : '1',
 			type: `${node.type}/${node.subtype || 'octet-stream'}`,
 			encoding: node.encoding,
@@ -134,7 +152,9 @@ function findAttachments(node, path = []) {
 	}
 
 	if (node.childNodes) {
+		// Traverse multipart children depth-first and merge matches.
 		node.childNodes.forEach((child, i) => {
+			// IMAP part indices are 1-based in each multipart level.
 			attachments.push(...findAttachments(child, [...path, i + 1]));
 		});
 	}
